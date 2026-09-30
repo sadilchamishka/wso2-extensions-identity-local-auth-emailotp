@@ -18,6 +18,7 @@
 
 package org.wso2.carbon.identity.local.auth.emailotp;
 
+import org.mockito.ArgumentCaptor;
 import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 import org.testng.Assert;
@@ -39,7 +40,6 @@ import org.wso2.carbon.identity.application.authentication.framework.model.Authe
 import org.wso2.carbon.identity.application.authentication.framework.util.FrameworkConstants;
 import org.wso2.carbon.identity.application.authentication.framework.util.FrameworkUtils;
 import org.wso2.carbon.identity.central.log.mgt.utils.LoggerUtils;
-import org.wso2.carbon.identity.core.util.IdentityConfigParser;
 import org.wso2.carbon.identity.core.util.IdentityTenantUtil;
 import org.wso2.carbon.identity.event.services.IdentityEventService;
 import org.wso2.carbon.identity.local.auth.emailotp.constant.AuthenticatorConstants;
@@ -69,6 +69,8 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockStatic;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertNotNull;
@@ -120,7 +122,6 @@ public class EmailOTPContextBasedRetryResendTest {
     private MockedStatic<LoggerUtils> loggerUtils;
     private MockedStatic<UserCoreUtil> userCoreUtil;
     private MockedStatic<IdentityTenantUtil> identityTenantUtil;
-    private MockedStatic<IdentityConfigParser> staticIdentityConfigParser;
 
     @BeforeMethod
     public void setUp() {
@@ -145,14 +146,6 @@ public class EmailOTPContextBasedRetryResendTest {
         loggerUtils = mockStatic(LoggerUtils.class);
         userCoreUtil = mockStatic(UserCoreUtil.class, Mockito.CALLS_REAL_METHODS);
         identityTenantUtil = mockStatic(IdentityTenantUtil.class);
-        /*
-         * initiateAuthenticationRequest ends in redirectToEmailOTPLoginPage, which reads
-         * IdentityConfigParser.getInstance(). Unmocked that walks into CarbonUtils.getCarbonHome()
-         * and NPEs on the unset carbon.home, which would mask any real failure in the flow.
-         */
-        staticIdentityConfigParser = mockStatic(IdentityConfigParser.class);
-        staticIdentityConfigParser.when(IdentityConfigParser::getInstance)
-                .thenReturn(mock(IdentityConfigParser.class));
 
         loggerUtils.when(LoggerUtils::isDiagnosticLogsEnabled).thenReturn(false);
         identityTenantUtil.when(() -> IdentityTenantUtil.getTenantId(TENANT_DOMAIN)).thenReturn(-1234);
@@ -195,9 +188,6 @@ public class EmailOTPContextBasedRetryResendTest {
         }
         if (identityTenantUtil != null) {
             identityTenantUtil.close();
-        }
-        if (staticIdentityConfigParser != null) {
-            staticIdentityConfigParser.close();
         }
     }
 
@@ -387,6 +377,15 @@ public class EmailOTPContextBasedRetryResendTest {
         assertEquals(((Number) resendCount).intValue(), 1,
                 "Context resend count should be reset and then counted as the first resend of the "
                         + "new allowance.");
+
+        /*
+         * The claim write happens only after the resend was allowed and the OTP sent, so this also
+         * proves the flow was not short-circuited before the assertions above.
+         */
+        ArgumentCaptor<Map<String, String>> claims = ArgumentCaptor.forClass(Map.class);
+        verify(userStoreManager).setUserClaimValues(anyString(), claims.capture(), any());
+        assertEquals(claims.getValue().get(EMAIL_OTP_RESEND_ATTEMPTS_CLAIM), "1",
+                "The persisted resend count should be reset to the first resend of the new allowance.");
     }
 
     @Test(description = "Flow: while the user-based resend block duration is still running, the " +
@@ -419,6 +418,9 @@ public class EmailOTPContextBasedRetryResendTest {
         assertNotNull(resendCount, "Context resend count should still be present.");
         assertEquals(((Number) resendCount).intValue(), resendLimit,
                 "Context resend count must not be reset while the block duration is still running.");
+
+        // The blocked path returns before sending, so nothing is persisted.
+        verify(userStoreManager, never()).setUserClaimValues(anyString(), any(Map.class), any());
     }
 
     /**
@@ -486,12 +488,27 @@ public class EmailOTPContextBasedRetryResendTest {
 
     /**
      * Invokes the private {@code initiateAuthenticationRequest}.
+     * <p>
+     * The method ends in {@code redirectToEmailOTPLoginPage}, whose dependencies are not wired in
+     * this test class, so the invocation fails there and the failure is ignored — as in the other
+     * flow tests here. Which exception surfaces depends on the environment
+     * ({@code IdentityConfigParser} reaching an unset {@code carbon.home} locally,
+     * {@code getCaptchaParams} finding no {@code IdentityGovernanceService} on CI), so the cause is
+     * deliberately not asserted.
+     * <p>
+     * Because that catch would also hide an earlier failure, the callers do not rely on context
+     * state alone: they assert on the persisted-claim write, which happens only after the resend has
+     * been allowed and the OTP sent, and never on the blocked path.
      */
     private void invokeInitiateAuthenticationRequest() throws Exception {
 
         Method method = findMethod(EmailOTPAuthenticator.class, "initiateAuthenticationRequest",
                 new Class[]{HttpServletRequest.class, HttpServletResponse.class, AuthenticationContext.class});
-        method.invoke(emailOTPAuthenticator, request, response, context);
+        try {
+            method.invoke(emailOTPAuthenticator, request, response, context);
+        } catch (InvocationTargetException ignored) {
+            // Expected: the trailing redirect cannot complete in this harness.
+        }
     }
 
     @Test(description = "Flow: processAuthenticationResponse with context-based retry limit " +
