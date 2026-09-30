@@ -39,6 +39,7 @@ import org.wso2.carbon.identity.application.authentication.framework.model.Authe
 import org.wso2.carbon.identity.application.authentication.framework.util.FrameworkConstants;
 import org.wso2.carbon.identity.application.authentication.framework.util.FrameworkUtils;
 import org.wso2.carbon.identity.central.log.mgt.utils.LoggerUtils;
+import org.wso2.carbon.identity.core.util.IdentityConfigParser;
 import org.wso2.carbon.identity.core.util.IdentityTenantUtil;
 import org.wso2.carbon.identity.event.services.IdentityEventService;
 import org.wso2.carbon.identity.local.auth.emailotp.constant.AuthenticatorConstants;
@@ -119,6 +120,7 @@ public class EmailOTPContextBasedRetryResendTest {
     private MockedStatic<LoggerUtils> loggerUtils;
     private MockedStatic<UserCoreUtil> userCoreUtil;
     private MockedStatic<IdentityTenantUtil> identityTenantUtil;
+    private MockedStatic<IdentityConfigParser> staticIdentityConfigParser;
 
     @BeforeMethod
     public void setUp() {
@@ -143,6 +145,14 @@ public class EmailOTPContextBasedRetryResendTest {
         loggerUtils = mockStatic(LoggerUtils.class);
         userCoreUtil = mockStatic(UserCoreUtil.class, Mockito.CALLS_REAL_METHODS);
         identityTenantUtil = mockStatic(IdentityTenantUtil.class);
+        /*
+         * initiateAuthenticationRequest ends in redirectToEmailOTPLoginPage, which reads
+         * IdentityConfigParser.getInstance(). Unmocked that walks into CarbonUtils.getCarbonHome()
+         * and NPEs on the unset carbon.home, which would mask any real failure in the flow.
+         */
+        staticIdentityConfigParser = mockStatic(IdentityConfigParser.class);
+        staticIdentityConfigParser.when(IdentityConfigParser::getInstance)
+                .thenReturn(mock(IdentityConfigParser.class));
 
         loggerUtils.when(LoggerUtils::isDiagnosticLogsEnabled).thenReturn(false);
         identityTenantUtil.when(() -> IdentityTenantUtil.getTenantId(TENANT_DOMAIN)).thenReturn(-1234);
@@ -185,6 +195,9 @@ public class EmailOTPContextBasedRetryResendTest {
         }
         if (identityTenantUtil != null) {
             identityTenantUtil.close();
+        }
+        if (staticIdentityConfigParser != null) {
+            staticIdentityConfigParser.close();
         }
     }
 
@@ -472,19 +485,13 @@ public class EmailOTPContextBasedRetryResendTest {
     }
 
     /**
-     * Invokes the private {@code initiateAuthenticationRequest}. The method redirects at the end,
-     * which the mocked response cannot complete, so an invocation failure is expected and ignored —
-     * the assertions read the state left on the context.
+     * Invokes the private {@code initiateAuthenticationRequest}.
      */
     private void invokeInitiateAuthenticationRequest() throws Exception {
 
         Method method = findMethod(EmailOTPAuthenticator.class, "initiateAuthenticationRequest",
                 new Class[]{HttpServletRequest.class, HttpServletResponse.class, AuthenticationContext.class});
-        try {
-            method.invoke(emailOTPAuthenticator, request, response, context);
-        } catch (InvocationTargetException ignored) {
-            // Expected: the flow ends in a redirect the mocked response cannot perform.
-        }
+        method.invoke(emailOTPAuthenticator, request, response, context);
     }
 
     @Test(description = "Flow: processAuthenticationResponse with context-based retry limit " +
