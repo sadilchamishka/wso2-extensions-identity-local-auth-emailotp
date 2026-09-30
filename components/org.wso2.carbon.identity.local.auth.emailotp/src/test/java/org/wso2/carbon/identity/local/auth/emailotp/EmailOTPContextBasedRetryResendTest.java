@@ -335,6 +335,158 @@ public class EmailOTPContextBasedRetryResendTest {
         assertEquals(((Number) resendCount).intValue(), 1, "Resend count should be 1 after one resend");
     }
 
+    @Test(description = "Flow: once the user-based resend block duration has elapsed, the context " +
+            "resend count is reset too, so the next resend is allowed")
+    public void testInitiateAuthenticationRequest_BlockDurationElapsed_ResetsContextResendCount()
+            throws Exception {
+
+        int resendLimit = 5;
+        int blockDurationMinutes = 10;
+
+        /*
+         * Both params have to go in together: the single-param overload replaces the whole runtime
+         * param map. TERMINATE_ON_RESEND_LIMIT_EXCEEDED is what turns a stale context counter into a
+         * hard failure rather than a retry prompt, as in the reported configuration.
+         */
+        Map<String, String> runtimeParams = new HashMap<>();
+        runtimeParams.put(MAXIMUM_RESEND_LIMIT, String.valueOf(resendLimit));
+        runtimeParams.put(TERMINATE_ON_RESEND_LIMIT_EXCEEDED, "true");
+        addRuntimeParamsToContext(runtimeParams);
+        context.setTenantDomain(TENANT_DOMAIN);
+        context.setRetrying(true);
+        context.setCurrentAuthenticator(EMAIL_OTP_AUTHENTICATOR_NAME);
+        // The user walked the counters up to the limit earlier in this same flow.
+        context.setProperty(EMAIL_OTP_RESEND_ATTEMPTS_CONTEXT_PROPERTY_NAME, resendLimit);
+
+        setUpResendFlowWithUserClaims(
+                String.valueOf(resendLimit),
+                // Last resend is older than the block duration, so the window has elapsed.
+                String.valueOf(System.currentTimeMillis() - ((blockDurationMinutes + 1) * 60_000L)),
+                String.valueOf(resendLimit),
+                String.valueOf(blockDurationMinutes));
+
+        invokeInitiateAuthenticationRequest();
+
+        assertNull(context.getProperty(FrameworkConstants.AUTH_ERROR_CODE),
+                "The resend must not be blocked once the block duration has elapsed.");
+        Object resendCount = context.getProperty(EMAIL_OTP_RESEND_ATTEMPTS_CONTEXT_PROPERTY_NAME);
+        assertNotNull(resendCount, "Context resend count should be set after the resend.");
+        assertEquals(((Number) resendCount).intValue(), 1,
+                "Context resend count should be reset and then counted as the first resend of the "
+                        + "new allowance.");
+    }
+
+    @Test(description = "Flow: while the user-based resend block duration is still running, the " +
+            "context resend count is left alone and the resend stays blocked")
+    public void testInitiateAuthenticationRequest_WithinBlockDuration_DoesNotResetContextResendCount()
+            throws Exception {
+
+        int resendLimit = 5;
+        int blockDurationMinutes = 10;
+
+        Map<String, String> runtimeParams = new HashMap<>();
+        runtimeParams.put(MAXIMUM_RESEND_LIMIT, String.valueOf(resendLimit));
+        runtimeParams.put(TERMINATE_ON_RESEND_LIMIT_EXCEEDED, "true");
+        addRuntimeParamsToContext(runtimeParams);
+        context.setTenantDomain(TENANT_DOMAIN);
+        context.setRetrying(true);
+        context.setCurrentAuthenticator(EMAIL_OTP_AUTHENTICATOR_NAME);
+        context.setProperty(EMAIL_OTP_RESEND_ATTEMPTS_CONTEXT_PROPERTY_NAME, resendLimit);
+
+        setUpResendFlowWithUserClaims(
+                String.valueOf(resendLimit),
+                // Last resend was a moment ago, so the user is still inside the block window.
+                String.valueOf(System.currentTimeMillis()),
+                String.valueOf(resendLimit),
+                String.valueOf(blockDurationMinutes));
+
+        invokeInitiateAuthenticationRequest();
+
+        Object resendCount = context.getProperty(EMAIL_OTP_RESEND_ATTEMPTS_CONTEXT_PROPERTY_NAME);
+        assertNotNull(resendCount, "Context resend count should still be present.");
+        assertEquals(((Number) resendCount).intValue(), resendLimit,
+                "Context resend count must not be reset while the block duration is still running.");
+    }
+
+    /**
+     * Wires up the mocks needed to drive a RESEND_OTP {@code initiateAuthenticationRequest} with
+     * user-based resend blocking enabled.
+     *
+     * @param resendAttemptsClaim  value of the persisted resend attempts claim.
+     * @param lastSentTimeClaim    value of the persisted last-sent-time claim, in millis.
+     * @param resendAttemptsConfig {@code EmailOTP.ResendAttemptsCount} connector value.
+     * @param blockDurationConfig  {@code EmailOTP.ResendBlockDuration} connector value, in minutes.
+     */
+    private void setUpResendFlowWithUserClaims(String resendAttemptsClaim, String lastSentTimeClaim,
+                                               String resendAttemptsConfig, String blockDurationConfig)
+            throws Exception {
+
+        when(request.getParameter(AuthenticatorConstants.RESEND)).thenReturn("true");
+        when(request.getParameter(AuthenticatorConstants.USER_NAME)).thenReturn(USERNAME);
+
+        setStepConfigWithEmailOTPAuthenticator(context);
+        when(ConfigurationFacade.getInstance()).thenReturn(configurationFacade);
+        when(configurationFacade.getAuthenticationEndpointURL()).thenReturn(DUMMY_LOGIN_PAGE_URL);
+        when(FileBasedConfigurationBuilder.getInstance()).thenReturn(fileBasedConfigurationBuilder);
+        when(FrameworkServiceDataHolder.getInstance()).thenReturn(frameworkServiceDataHolder);
+        when(frameworkServiceDataHolder.getRealmService()).thenReturn(realmService);
+        when(realmService.getTenantUserRealm(anyInt())).thenReturn(userRealm);
+        when(userRealm.getUserStoreManager()).thenReturn(userStoreManager);
+
+        AuthenticatedUser subject = new AuthenticatedUser();
+        subject.setUserName(USERNAME);
+        subject.setTenantDomain(TENANT_DOMAIN);
+        subject.setUserStoreDomain(USER_STORE_DOMAIN);
+        subject.setUserId(USER_ID);
+        context.setSubject(subject);
+
+        User user = new User(UUID.randomUUID().toString(), USERNAME, null);
+        user.setUserStoreDomain(USER_STORE_DOMAIN);
+        user.setTenantDomain(TENANT_DOMAIN);
+        List<User> userList = new ArrayList<>();
+        userList.add(user);
+
+        Map<String, String> claimMap = new HashMap<>();
+        claimMap.put(EMAIL_ADDRESS_CLAIM, EMAIL_ADDRESS);
+        claimMap.put(EMAIL_OTP_RESEND_ATTEMPTS_CLAIM, resendAttemptsClaim);
+        claimMap.put(EMAIL_OTP_LAST_SENT_TIME_CLAIM, lastSentTimeClaim);
+
+        when(userStoreManager.getUserListWithID(USERNAME_CLAIM, USERNAME, null)).thenReturn(userList);
+        when(userStoreManager.getUserClaimValues(any(), any(), any())).thenReturn(claimMap);
+        when(userStoreManager.getSecondaryUserStoreManager(anyString())).thenReturn(userStoreManager);
+        userCoreUtil.when(() -> UserCoreUtil.getDomainFromThreadLocal()).thenReturn(DEFAULT_USER_STORE);
+
+        authenticatorUtils.when(() ->
+                AuthenticatorUtils.getEmailAuthenticatorConfig(
+                        AuthenticatorConstants.ConnectorConfig.EMAIL_OTP_RESEND_ATTEMPTS_COUNT,
+                        TENANT_DOMAIN)).thenReturn(resendAttemptsConfig);
+        authenticatorUtils.when(() ->
+                AuthenticatorUtils.getEmailAuthenticatorConfig(
+                        AuthenticatorConstants.ConnectorConfig.EMAIL_OTP_RESEND_BLOCK_DURATION,
+                        TENANT_DOMAIN)).thenReturn(blockDurationConfig);
+        authenticatorUtils.when(() ->
+                AuthenticatorUtils.getEmailOTPLoginPageUrl(any(), anyString())).thenReturn(DUMMY_LOGIN_PAGE_URL);
+        when(FileBasedConfigurationBuilder.getInstance().getAuthenticatorBean(anyString()))
+                .thenReturn(getAuthenticatorConfig());
+        AuthenticatorDataHolder.setRealmService(realmService);
+    }
+
+    /**
+     * Invokes the private {@code initiateAuthenticationRequest}. The method redirects at the end,
+     * which the mocked response cannot complete, so an invocation failure is expected and ignored —
+     * the assertions read the state left on the context.
+     */
+    private void invokeInitiateAuthenticationRequest() throws Exception {
+
+        Method method = findMethod(EmailOTPAuthenticator.class, "initiateAuthenticationRequest",
+                new Class[]{HttpServletRequest.class, HttpServletResponse.class, AuthenticationContext.class});
+        try {
+            method.invoke(emailOTPAuthenticator, request, response, context);
+        } catch (InvocationTargetException ignored) {
+            // Expected: the flow ends in a redirect the mocked response cannot perform.
+        }
+    }
+
     @Test(description = "Flow: processAuthenticationResponse with context-based retry limit " +
             "increments retry count on invalid OTP")
     public void testProcessAuthenticationResponse_ContextRetry_IncrementsCountOnInvalidOtp() throws Exception {
